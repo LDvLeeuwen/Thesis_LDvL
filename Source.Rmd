@@ -1,0 +1,1339 @@
+---
+title: "Source"
+output: pdf_document
+date: "2023-04-30"
+---
+
+## Setup
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy = TRUE)
+
+# Setting a seed
+set.seed(3334)
+```
+
+### Libraries
+
+```{r Libraries, include=FALSE}
+# General packages
+library(sjlabelled)
+library(haven)
+library(dplyr)
+library(tidyverse)
+library(splitstackshape)
+library(progress)
+library(car)
+
+# Visualisation
+library(ggplot2)
+library(corrplot)
+library(ggcorrplot)
+library(naniar)
+
+# Processing, imputation and more
+library(keras)
+library(cluster)
+library(tensorflow)
+library(mice)
+library(caret)
+library(ggmice)
+
+# Algorithmic models
+library(randomForest)
+library(e1071)
+library(xgboost)
+library(nnet)
+library(neuralnet)
+library(glmnet)
+library(glmnetUtils)
+library(ranger)
+library(adabag)
+```
+
+### Loading in the data
+
+```{r Loading in data}
+raw_df <- read_dta('data/scottish.dta')
+```
+
+## Preprocessing
+
+### Removal of irrelevant variables
+
+#### Removal of routing questions
+
+```{r Cleaning 1}
+cleaned_df <- raw_df %>%                             
+  select(where(~!any(. == -1, na.rm = TRUE))) %>%  # First, remove all columns that have routing questions
+  mutate_all(~ifelse(. %in% c(-9,-99), NA, .)) %>% # Then, all true missing values were coded as -9 | -99
+  select(where(~ mean(is.na(.)) < 0.8))            # Finally, remove some columns with more than 80% 
+                                                   # missingness; explained below
+```
+
+An explanation for why the variables with more than 80% missingness were removed; These were variables that had a lot of missing values that could not be explained by the codebook, and no further information was given. With the high amount, these variables were deemed untrustworthy. The variables in question are all about smoking, so not much additional information was lost, as smoking is well represented by other variables.
+
+#### Removal of redundant variables with correlation function
+
+```{r Function - correlation}
+calculate_high_correlations <- function(data, threshold) {
+  # Calculate correlation matrix
+  cor_matrix <- cor(data, use = 'pairwise.complete.obs')
+  
+  # Extract correlations greater than the threshold
+  high_cor <- which(abs(cor_matrix) > threshold & cor_matrix != 1, arr.ind = TRUE)
+  
+  # Remove duplicate correlations
+  high_cor <- high_cor[high_cor[,1] < high_cor[,2],]
+  
+  # Store column names in col1 and col2
+  col1 <- names(data)[high_cor[,1]]
+  col2 <- names(data)[high_cor[,2]]
+  
+  # Print results
+  if (length(col2) > 0) {
+    cat(paste0("The correlations greater than ", threshold, " are:\n"))
+    for (i in 1:nrow(high_cor)) {
+      var1 <- col1[i]
+      var2 <- col2[i]
+      ind1 <- high_cor[i,1]
+      ind2 <- high_cor[i,2]
+      cat(paste0(var1, " (", ind1, ") and ", var2, " (",ind2, "): ", cor_matrix[ind1, high_cor[i,2]], "\n"))
+    }
+  } else {
+    cat("There are no correlations greater than ", threshold, ".\n")
+  }
+  
+  # Find col1 columns not present in col2
+  left_side <- setdiff(col1, col2)
+  
+  # Return the character vector
+  return(unique(left_side))
+}
+```
+
+```{r Cleaning 2}
+# Calculating the pairs with correlation higher than 0.7
+cor_result <- calculate_high_correlations(cleaned_df, 0.7)
+
+# Removing the first half of those pairs
+cleaned_df <- cleaned_df[, !(colnames(cleaned_df) %in% cor_result)]
+```
+
+#### Removal of redundant variables based on qualitative assessment
+
+```{r Cleaning 3}
+# Get column names starting with '__', as they are redundant variables about name brands
+redu1 <- colnames(cleaned_df)[grep("^__", colnames(cleaned_df))]
+
+# Then remove all of the maknow paknow items, as all important information is stored in dadscore2
+redu2 <- colnames(cleaned_df)[grep("^(ma|pa)know[1-5]x?$", colnames(cleaned_df))]
+
+# Then remove some drug-related items that were coded differently but held similar information
+redu3 <- colnames(cleaned_df)[grep("^dgof", colnames(cleaned_df))]
+
+# Combine the column names with other redundant variables
+redu_vector <- c("Refid", "mumscore", "dadscore", "smcost_bands","wwscore", "final_wt", "healthboard","numbrand", 
+                 "locauth", "museum", "theatre", "SDQscore", "smokstat", "smokstat2", "subuse", "cgstat", 
+                 redu1, redu2, redu3)
+
+cleaned_df <- cleaned_df[, !(colnames(cleaned_df) %in% redu_vector)]
+```
+
+### Dependent variable selection
+
+```{r Variable selection}
+# Calculate the percent missing for each column
+missing_percent <- colMeans(is.na(cleaned_df))
+
+# Select the columns with more than 10% missingness
+selected_cols <- names(missing_percent[missing_percent > 0.10])
+
+# Then determine which variables are eligible
+possible_df <- cleaned_df %>% 
+  select(all_of(selected_cols)) 
+```
+
+#### Visualisation intermission: 
+
+```{r Visualisation}
+
+```
+
+#### Missingness pattern analysis
+
+```{r Function - dummies}
+dummy_maker <- function(data, variable_list) {
+  dummy_names <- c()
+  
+  for (variable in variable_list) {
+    dummy_variable <- paste0(variable, "_DUMMY")
+    data[dummy_variable] <- ifelse(is.na(data[[variable]]), 0, 1)
+    dummy_names <- c(dummy_names, dummy_variable) 
+  }
+  result <- list(data = data, dummy_names = dummy_names)
+  return(result)
+}
+```
+
+```{r Form dummies}
+# Make dummies for each possible variable
+dummy_df <- dummy_maker(possible_df, colnames(possible_df))
+dummy_df <- dummy_df$data
+
+# Remove all non-dummy variables
+dummy_df <- dummy_df[, -grep("_DUMMY$", names(dummy_df), invert = TRUE)]
+
+# Now, form distance matrix from the correlation matrix of the dummy_df
+dist_m <- as.dist(1 - cor(dummy_df))
+```
+
+##### Cluster analysis
+
+```{r Cluster analysis}
+# Perform hierarchical clustering
+hc <- hclust(dist_m, method = "average")
+
+# Cut the clusters
+clusters <- cutree(hc, h = 0.4) # cut tree so that there are 5 clusters
+```
+
+### Forming of target frames
+
+```{r Function - extract_names}
+extract_names <- function(data, cluster_number) {
+  cluster_cols <- names(data[data == cluster_number])
+  cleaned_cols <- gsub("_DUMMY$", "", cluster_cols)
+  return(cleaned_cols)
+}
+
+# Extract the names from the selected clusters
+cl2 <- extract_names(clusters, 2)
+cl3 <- extract_names(clusters, 3)
+cl4 <- extract_names(clusters, 4)
+cl6 <- extract_names(clusters, 6)
+```
+
+#### Make dummies for each target variable
+
+```{r Function - create_target_frames}
+create_target_frames <- function(original_data, column_vectors) {
+  data_frames <- list()  
+  
+  for (i in 1:length(column_vectors)) {
+    excluded_columns <- column_vectors[[i]]
+    included_columns <- setdiff(colnames(original_data), excluded_columns)
+    
+    data <- original_data
+    first_column <- excluded_columns[[1]]
+      
+      # Create dummy variables for the first column with dummy function
+    dummy_result <- dummy_maker(data, first_column)
+    first_column <- dummy_result$dummy_names
+      
+      # Update the data frame with the dummy variables
+    data <- dummy_result$data
+      
+      # Include the dummy variable name in the included columns
+    included_columns <- c(included_columns, first_column)
+
+    # Subset the data frame based on the included columns
+    data_frames[[i]] <- data[, included_columns]
+  }
+  
+  return(data_frames)
+}
+```
+
+The 4 target frames are as follows:
+
+```{r Create target frames}
+target_frames <- create_target_frames(cleaned_df, list(cl2,cl3,cl4,cl6))
+dummy_names <- c("welloff_DUMMY","helptch_DUMMY","alrisk_DUMMY","dadscore2_DUMMY")
+```
+
+#### Factorisation 
+
+Bit of an odd step, but has te be done now for the imputation process later on
+
+```{r, Function - factor_numeric_maker}
+factor_numeric_maker <- function(data, numeric_vars) {
+  
+  to_transform <- names(data)[!names(data) %in% numeric_vars]
+  
+  new_data <- data.frame(matrix(ncol = ncol(data), nrow = nrow(data)))
+  colnames(new_data) <- colnames(data)
+  for (var in names(data)) {
+    if (var %in% numeric_vars) {
+      new_data[[var]] <- as.numeric(data[[var]])
+    } else {
+      new_data[[var]] <- as.factor(data[[var]])
+    }
+  }
+  
+  for (var in names(data)) {
+    attr(new_data[[var]], "label") <- attr(data[[var]], "label")
+  }
+  
+  return(new_data)
+}
+```
+
+```{r, Factorising data frame}
+# Identify the numeric columns 
+numeric_cols <- c("smcost", "numeffects")
+
+for (i in seq_along(target_frames)) {
+  target_frames[[i]] <- factor_numeric_maker(target_frames[[i]], numeric_cols)
+}
+```
+
+### Imputation process
+
+#### Imputation with mice
+
+```{r Imputations with mice}
+# List for storage of imputed target frames 
+imputed_frames <- list()
+matrix_list <- list()
+
+# Loop over each data frame
+for (i in seq_along(target_frames)) {
+  frame <- target_frames[[i]]  
+  
+  # Create predictor matrix using quickpred function
+  predictor_matrix <- quickpred(frame[, -ncol(frame)], 
+                                mincor = 0.2, 
+                                minpuc = 0.2)
+  
+  # Impute missing values using mice
+  imputations <- mice(frame, 
+                       m = 1, 
+                       maxit = 3, 
+                       predictorMatrix = predictor_matrix,
+                       nnet.MaxNWts = 12000)
+  
+  # Access the imputed data frames
+  imputed_frame <- complete(imputations)
+  
+  # Store the imputed frames, imputations and matrices for later inspection
+  imputed_frames[[i]] <- imputed_frame
+  matrix_list[[i]] <- predictor_matrix
+}
+```
+
+##### Checking methods and logged events
+
+```{r Checking mice methods}
+# Check method to see whether correct imputation methods were used
+print(imputation_list[[1]]$method)
+
+# Check logged events
+print(imputation_list[[1]]$loggedEvents)
+```
+
+### Splitting the data set in train/test
+
+```{r Function - split_data}
+split_function <- function(data, target) {
+  train_indices <- createDataPartition(data[,target],
+                                       p = 0.65,
+                                       list = FALSE)
+  train_df <- data[train_indices, ]
+  test_df <- data[-train_indices, ]
+  
+  return(list(train = train_df, test = test_df))
+}
+```
+
+## Algorithmic Modelling
+
+```{r Results dataframe}
+# This is for the results of each model
+all_results <- data.frame(Target = character(),
+                          Model = character(),
+                          Version = character(),
+                          Sensitivity = numeric(),
+                          Specificity = numeric(),
+                          F1_Score = numeric(),
+                          Balanced_Accuracy = numeric(),
+                          stringsAsFactors = FALSE)
+```
+
+```{r Function - append_results}
+# Function to append results to the dataframe
+append_results <- function(target, model, version, sensitivity, specificity, f1_score, balanced_accuracy) {
+  new_row <- data.frame(Target = target,
+                        Model = model,
+                        Version = version,
+                        Sensitivity = sensitivity,
+                        Specificity = specificity,
+                        F1_Score = f1_score,
+                        Balanced_Accuracy = balanced_accuracy,
+                        stringsAsFactors = FALSE)
+  all_results <<- rbind(all_results, new_row)
+}
+```
+
+### RandomForest
+
+#### Data preparation
+
+For the RandomForest model, class variables should be coded as factors, except the numerical ones.
+
+```{r RF - Data prep}
+# Create some empty lists for train/test sets
+RF_trainsets <- list() 
+RF_testsets <- list() 
+
+# Loop over the data frames for training/test sets
+for(i in seq_along(imputed_frames)) {
+  
+  current_frame <- imputed_frames[[i]]
+  current_target <- dummy_names[[i]]
+  
+  # Split using split_function
+  result <- split_function(current_frame, current_target)
+  
+  RF_trainsets[[i]] <- result$train
+  RF_testsets[[i]] <- result$test
+}
+```
+
+#### Base models
+
+```{r RF - Base models}
+RF0_models <- list()
+
+# Loop over the data frames and target variables
+for (i in seq_along(RF_trainsets)) {
+
+  current_train <- RF_trainsets[[i]]
+  current_target <- dummy_names[i]
+
+  x <- current_train[, !colnames(current_train) %in% current_target]
+  y <- as.factor(current_train[[current_target]])
+  
+  # Apply base parameters
+  model <- randomForest(x = x,
+                        y = y,
+                        data = current_train,
+                        ntree = 500,
+                        type = "classification")
+  
+  # Store the model in the list
+  RF0_models[[i]] <- model
+}
+```
+
+```{r RF - Base models results}
+RF0_preds <- list()
+
+for (i in seq_along(RF0_models)) {
+  
+  model <- RF0_models[[i]]
+  current_test <- RF_testsets[[i]]
+  current_target <- current_test[[dummy_names[i]]]
+  
+  RF0_preds[[i]] <- predict(model, current_test)
+  
+  cm <- confusionMatrix(data = RF0_preds[[i]],
+                        reference = current_target)
+  
+  # Append the results to the all_results df
+  append_results(dummy_names[i], "Random Forest", "Base",
+                 cm[["byClass"]][["Sensitivity"]],
+                 cm[["byClass"]][["Specificity"]],
+                 cm[["byClass"]][["F1"]],
+                 cm[["byClass"]][["Balanced Accuracy"]])
+}
+```
+
+#### Tuned models (Parameter tuning)
+
+```{r Function - balanced_calc}
+# Make a new function to calculate based on balanced accuracy and not ROC/Normal accuracy
+balanced_calc <- function(data, lev = NULL, model = NULL) {
+  cm <- confusionMatrix(data = data$pred, reference = data$obs, positive = lev[1])
+  acc <- cm$byClass["Balanced Accuracy"]
+  return(acc)
+}
+```
+
+```{r RF - Parameter tuned}
+RF1_models <- list()
+pb <- progress_bar$new(total = 4, format = "[:bar] :percent :elapsed")
+
+# Loop over the data frames and target variables
+for (i in seq_along(RF_trainsets)) {
+
+  current_train <- RF_trainsets[[i]]
+  current_target <- dummy_names[i]
+
+  x <- current_train[, !colnames(current_train) %in% current_target]
+  y <- current_train[[current_target]]
+  
+  # Apply stratified k-folds
+  cvIndex <- createFolds(factor(y), 5, returnTrain = TRUE)
+  
+  # Define parameter grid
+  grid <- expand.grid(mtry = c(5, 10, 15),  
+                      splitrule = c("gini","extratrees"),
+                      min.node.size = c(1, 5, 10))
+  
+  # Let trainControl evaluate on Balanced Accuracy
+  ctrl <- trainControl(index = cvIndex,
+                       method = "cv",
+                       classProbs = TRUE,
+                       summaryFunction = balanced_calc,
+                       verboseIter = FALSE)
+
+  model <- caret::train(x, 
+                        make.names(y),
+                        method = "ranger",
+                        trControl = ctrl,
+                        tuneGrid = grid,
+                        metric = "Balanced Accuracy")
+  
+  # Store the model in the list
+  RF1_models[[i]] <- model
+  pb$tick()
+  
+}
+```
+
+```{r RF - Parameter tuned results}
+RF1_preds <- list()
+
+for (i in seq_along(RF1_models)) {
+  
+  model <- RF1_models[[i]]
+  current_test <- RF_testsets[[i]]
+  current_target <- current_test[[dummy_names[i]]]
+  
+  # RF predictions give levels X0 and X1, so convert them
+  RF1_preds[[i]] <- ifelse(predict(model, current_test) == "X0", 0, 1)
+
+  cm <- confusionMatrix(data = as.factor(RF1_preds[[i]]),
+                        reference = current_target)
+  
+  # Append the results to the all_results df
+  append_results(dummy_names[i], "Random Forest", "Parameter Tuned",
+                 cm[["byClass"]][["Sensitivity"]],
+                 cm[["byClass"]][["Specificity"]],
+                 cm[["byClass"]][["F1"]],
+                 cm[["byClass"]][["Balanced Accuracy"]])
+}
+```
+
+#### Tuned models (Parameter Tuning + Class weights)
+
+```{r RF - Weights}
+RF_weights <- list()
+
+for (i in seq_along(RF_trainsets)) {
+  
+  current_train <- RF_trainsets[[i]]
+  current_target <- dummy_names[i]
+  
+  # Make weights
+  weights <- ifelse(current_train[, current_target] == 0,
+                    (1/table(current_train[, current_target])[1]) * 0.5,
+                    (1/table(current_train[, current_target])[2]) * 0.5)
+  
+  RF_weights[[i]] <- weights
+}
+```
+
+```{r RF - Parameter tuned + class weigths}
+# Unfortunately, the RF1_models name has to be used for all tuned models, as each Random Forest model was 
+# taking up too memory. Each tuned version will therefore be expressed as RF1, but the results were of course 
+# individually saved. 
+
+RF1_models <- list()
+pb <- progress_bar$new(total = 4, format = "[:bar] :percent :elapsed")
+
+# Loop over the data frames and target variables
+for (i in seq_along(RF_trainsets)) {
+
+  current_train <- RF_trainsets[[i]]
+  current_target <- dummy_names[i]
+
+  x <- current_train[, !colnames(current_train) %in% current_target]
+  y <- current_train[[current_target]]
+  
+  # Apply stratified k-folds
+  cvIndex <- createFolds(factor(y), 5, returnTrain = TRUE)
+  
+  # Define parameter grid
+  grid <- expand.grid(mtry = c(5, 10, 15),  
+                      splitrule = c("gini","extratrees"),
+                      min.node.size = c(1, 5, 10))
+  
+  # Let trainControl evaluate on Balanced Accuracy
+  ctrl <- trainControl(index = cvIndex,
+                       method = "cv",
+                       classProbs = TRUE,
+                       summaryFunction = balanced_calc,
+                       verboseIter = FALSE)
+
+  model <- caret::train(x, 
+                        make.names(y),
+                        method = "ranger",
+                        trControl = ctrl,
+                        tuneGrid = grid,
+                        metric = "Balanced Accuracy",
+                        weights = RF_weights[[i]])
+  
+  # Store the model in the list
+  RF1_models[[i]] <- model
+  pb$tick()
+}
+```
+
+```{r RF - Parameter tuned + class_weights results}
+# As the predictions do not take up that much memory, another object can be made.
+# Note that the class weights + parameter model replaced the model that only did 
+# parameter tuning (in RF1_models).
+
+RF2_preds <- list()
+
+for (i in seq_along(RF1_models)) {
+  
+  model <- RF1_models[[i]]
+  current_test <- RF_testsets[[i]]
+  current_target <- current_test[[dummy_names[i]]]
+  
+  # RF predictions give levels X0 and X1, so convert them
+  RF2_preds[[i]] <- ifelse(predict(model, current_test) == "X0", 0, 1)
+
+  cm <- confusionMatrix(data = as.factor(RF2_preds[[i]]),
+                        reference = current_target)
+  
+  # Append the results to the all_results df
+  append_results(dummy_names[i], "Random Forest", "Parameter Tuned + Class Weights",
+                 cm[["byClass"]][["Sensitivity"]],
+                 cm[["byClass"]][["Specificity"]],
+                 cm[["byClass"]][["F1"]],
+                 cm[["byClass"]][["Balanced Accuracy"]])
+}
+```
+
+#### Tuned models (Parameter Tuning + Class weights + Threshold Tuning)
+
+```{r RF Parameter tuned + class weights + threshold tuning}
+# Create an empty list to store the optimal thresholds and balanced accuracies
+optimal_thresholds <- list()
+max_balanced_accs <- list()
+thresholds <- seq(0.05, 0.5, 0.05)
+
+# Iterate over the models
+for (i in seq_along(RF1_models)) {
+  
+  model <- RF1_models[[i]]
+  current_train <- RF_trainsets[[i]]
+  current_target <- current_train[[dummy_names[i]]]
+  
+  # Get the predicted probabilities for the positive class
+  predicted_probs <- predict(model, type = "prob")
+  
+  # Create a data frame to store evaluation metrics
+  RF_evaluation <- data.frame(Threshold = numeric(),
+                           "Balanced Accuracy" = numeric(),
+                           stringsAsFactors = FALSE)
+  
+  # Calculate evaluation metrics for each threshold
+  for (threshold in thresholds) {
+    # Convert predicted probabilities to class labels based on the threshold
+    predicted_labels <- factor(ifelse(predicted_probs[, "X0"] >= threshold, 0, 1), levels = c(0, 1))
+    
+    # Calculate evaluation metrics
+    eval_metrics <- caret::confusionMatrix(predicted_labels, as.factor(current_target))
+    balanced_acc <- eval_metrics$byClass["Balanced Accuracy"]
+    
+    # Store the evaluation metrics in the data frame
+    new_row <- data.frame("Threshold" = threshold, "BalancedAccuracy" = balanced_acc)
+    RF_evaluation <- rbind(RF_evaluation, new_row)
+  }
+  
+  # Find the threshold with maximum balanced accuracy
+  max_balanced_acc <- max(RF_evaluation[, "BalancedAccuracy"])
+  optimal_threshold <- RF_evaluation[, "Threshold"][RF_evaluation[, "BalancedAccuracy"] == max_balanced_acc]
+  
+  # Store the optimal threshold and balanced accuracy in the lists
+  optimal_thresholds[[i]] <- optimal_threshold
+  max_balanced_accs[[i]] <- max_balanced_acc
+  
+  # Print the results
+  cat("Model", i, ":\n")
+  cat("Optimal Threshold:", optimal_threshold, "\n")
+  cat("Balanced Accuracy:", max_balanced_acc, "\n\n")
+}
+
+# New predictions could be made on the test set, but as the optimal thresholds are all the same as 
+# the default, these predictions would just be as bad as the class weights + parameter tuned model.
+```
+
+### Neural Networks 
+
+#### Data preparation 
+
+```{r NN - Data prep}
+onehot_frames <- list()
+
+for (i in seq_along(imputed_frames)) {
+  
+  # Scale numeric variables if present
+  current_frame <- imputed_frames[[i]]
+  current_frame <- current_frame %>% 
+    mutate_at(c("smcost","numeffects"), ~(scale(.) %>% as.vector))
+  
+  # Then, perform one-hot encoding for the factor variables
+  encoded_frame <- fastDummies::dummy_cols(current_frame,
+                                           select_columns = names(current_frame)[!(names(current_frame) %in%
+                                        c(numeric_cols, dummy_names))],
+                                        remove_first_dummy = TRUE,
+                                        remove_selected_columns = TRUE)
+  
+  # Assign the updated data frame back to the list
+  onehot_frames[[i]] <- encoded_frame
+}
+```
+
+```{r NN - Data prep 2}
+# Set different seed
+set.seed(222)
+
+# Create some empty lists for train/test sets
+NN_trainsets <- list() 
+NN_testsets <- list() 
+
+# Loop over the data frames for training/test sets
+for(i in seq_along(onehot_frames)) {
+  
+  current_frame <- onehot_frames[[i]]
+  current_target <- dummy_names[[i]]
+  
+  # Split using split_function
+  result <- split_function(current_frame, current_target)
+  
+  NN_trainsets[[i]] <- result$train
+  NN_testsets[[i]] <- result$test
+}
+```
+
+#### Base models
+
+```{r NN - Base models}
+NN0_models <- list()
+
+# Loop over the data frames and target variables
+for (i in seq_along(NN_trainsets)) {
+
+  current_train <- NN_trainsets[[i]]
+  current_target <- dummy_names[i]
+
+  x <- current_train[, !colnames(current_train) %in% current_target]
+  y <- as.numeric(current_train[[current_target]])
+  
+  # Apply base parameters
+  model <- nnet(x = x,
+                y = y,
+                data = current_train,
+                size = 10,
+                trace = FALSE,
+                MaxNWts = 5000)
+  
+  # Store the model in the list
+  NN0_models[[i]] <- model
+}
+```
+
+```{r NN - Base models results}
+NN0_preds <- list()
+
+for (i in seq_along(NN0_models)) {
+  
+  model <- NN0_models[[i]]
+  current_test <- NN_testsets[[i]]
+  current_target <- current_test[[dummy_names[i]]]
+  
+  # Predict with the base models
+  NN0_preds[[i]] <- predict(model, NN_testsets[[i]])
+    
+  cm <- confusionMatrix(data = as.factor(NN0_preds[[i]]),
+                        reference = current_target)
+  
+  # Append the results to the all_results df
+  append_results(dummy_names[i], "Neural Networks", "Base",
+                 cm[["byClass"]][["Sensitivity"]],
+                 cm[["byClass"]][["Specificity"]],
+                 cm[["byClass"]][["F1"]],
+                 cm[["byClass"]][["Balanced Accuracy"]])
+}
+```
+
+#### Tuned models (Parameter tuning)
+
+```{r NN - Parameter tuned}
+NN1_models <- list()
+pb <- progress_bar$new(total = 4, format = "[:bar] :percent :elapsed")
+
+# Loop over the data frames and target variables
+for (i in seq_along(NN_trainsets)) {
+
+  current_train <- NN_trainsets[[i]]
+  current_target <- dummy_names[i]
+
+  x <- current_train[, !colnames(current_train) %in% current_target]
+  y <- as.numeric(current_train[[current_target]])
+  
+  # Apply stratified k-folds
+  cvIndex <- createFolds(factor(y), 5, returnTrain = TRUE)
+  
+  # Define parameter grid
+  grid <- expand.grid(size = c(5, 10, 20, 50),  
+                      decay = c(0, 0.001, 0.01, 0.1))
+  
+  # Let trainControl evaluate on Balanced Accuracy
+  ctrl <- trainControl(index = cvIndex,
+                       method = "cv",
+                       classProbs = TRUE,
+                       summaryFunction = balanced_calc,
+                       verboseIter = FALSE)
+
+  model <- caret::train(x,
+                        make.names(y),
+                        method = "nnet",
+                        trControl = ctrl,
+                        tuneGrid = grid,
+                        metric = "Balanced Accuracy",
+                        MaxNWts = 30000)
+  
+  # Store the model in the list
+  NN1_models[[i]] <- model
+  pb$tick()
+}
+```
+
+```{r NN - Parameter tuned results}
+NN1_preds <- list()
+
+for (i in seq_along(NN1_models)) {
+  
+  model <- NN1_models[[i]]
+  current_test <- NN_testsets[[i]]
+  current_target <- current_test[[dummy_names[i]]]
+  
+  # Predictions have levels X1 and X2, so convert them to 0 and 1 respectively
+  NN1_preds[[i]] <- ifelse(predict(model, current_test) == "X1", 0, 1)
+
+  cm <- confusionMatrix(data = as.factor(NN1_preds[[i]]),
+                        reference = current_target)
+  
+  # Append the results to the all_results df
+  append_results(dummy_names[i], "Neural Networks", "Parameter Tuned",
+                 cm[["byClass"]][["Sensitivity"]],
+                 cm[["byClass"]][["Specificity"]],
+                 cm[["byClass"]][["F1"]],
+                 cm[["byClass"]][["Balanced Accuracy"]])
+}
+```
+
+#### Tuned models (Parameter Tuning + Class Weights)
+
+```{r NN - Weights}
+NN_weights <- list()
+
+for (i in seq_along(NN_trainsets)) {
+  
+  current_train <- NN_trainsets[[i]]
+  current_target <- dummy_names[i]
+  
+  # Make weights
+  weights <- ifelse(current_train[, current_target] == 0,
+                    (1/table(current_train[, current_target])[1]) * 0.5,
+                    (1/table(current_train[, current_target])[2]) * 0.5)
+  
+  NN_weights[[i]] <- weights
+}
+```
+
+```{r NN - Parameter tuned + class weights}
+NN2_models <- list()
+pb <- progress_bar$new(total = 4, format = "[:bar] :percent :elapsed")
+
+# Loop over the data frames and target variables
+for (i in seq_along(NN_trainsets)) {
+
+  current_train <- NN_trainsets[[i]]
+  current_target <- dummy_names[i]
+
+  x <- current_train[, !colnames(current_train) %in% current_target]
+  y <- as.numeric(current_train[[current_target]])
+  
+  # Apply stratified k-folds
+  cvIndex <- createFolds(factor(y), 5, returnTrain = TRUE)
+  
+  # Define parameter grid
+  grid <- expand.grid(size = c(5, 10, 20, 50),  
+                      decay = c(0, 0.001, 0.01, 0.1))
+  
+  # Let trainControl evaluate on Balanced Accuracy
+  ctrl <- trainControl(index = cvIndex,
+                       method = "cv",
+                       classProbs = TRUE,
+                       summaryFunction = balanced_calc,
+                       verboseIter = FALSE)
+
+  model <- caret::train(x,
+                        make.names(y),
+                        method = "nnet",
+                        trControl = ctrl,
+                        tuneGrid = grid,
+                        metric = "Balanced Accuracy",
+                        MaxNWts = 30000,
+                        weights = NN_weights[[i]],
+                        trace = FALSE)
+  
+  # Store the model in the list
+  NN2_models[[i]] <- model
+  pb$tick()
+}
+```
+
+```{r NN - Parameter tuned + class weights results}
+NN2_preds <- list()
+
+for (i in seq_along(NN2_models)) {
+  
+  model <- NN2_models[[i]]
+  current_test <- NN_testsets[[i]]
+  current_target <- current_test[[dummy_names[i]]]
+  
+  # Predictions have levels X1 and X2, so convert them to 0 and 1 respectively
+  NN1_preds[[i]] <- ifelse(predict(model, current_test) == "X1", 0, 1)
+
+  cm <- confusionMatrix(data = as.factor(NN1_preds[[i]]),
+                        reference = current_target)
+  
+  # Append the results to the all_results df
+  append_results(dummy_names[i], "Neural Networks", "Parameter Tuned + Class Weights",
+                 cm[["byClass"]][["Sensitivity"]],
+                 cm[["byClass"]][["Specificity"]],
+                 cm[["byClass"]][["F1"]],
+                 cm[["byClass"]][["Balanced Accuracy"]])
+}
+```
+
+#### Tuned models (Parameter Tuning + Class Weights + Threshold Tuning)
+
+```{r NN - Parameter tuning + class weigths + threshold tuning}
+# Create an empty list to store the optimal thresholds and balanced accuracies
+optimal_thresholds <- list()
+max_balanced_accs <- list()
+
+# Iterate over the models
+for (i in seq_along(NN2_models)) {
+  
+  model <- NN2_models[[i]]
+  current_train <- NN_trainsets[[i]]
+  current_target <- current_train[[dummy_names[i]]]
+  
+  # Get the predicted probabilities for the positive class
+  predicted_probs <- predict(model, type = "prob")
+  
+  # Create a data frame to store evaluation metrics
+  evaluation <- data.frame(Threshold = numeric(),
+                           "Balanced Accuracy" = numeric(),
+                           stringsAsFactors = FALSE)
+  
+  # Calculate evaluation metrics for each threshold
+  for (threshold in thresholds) {
+    # Convert predicted probabilities to class labels based on the threshold
+    predicted_labels <- factor(ifelse(predicted_probs[, "X1"] >= threshold, 0, 1), levels = c(0, 1))
+    
+    # Calculate evaluation metrics
+    eval_metrics <- caret::confusionMatrix(predicted_labels, as.factor(current_target))
+    balanced_acc <- eval_metrics$byClass["Balanced Accuracy"]
+    
+    # Store the evaluation metrics in the data frame
+    new_row <- data.frame("Threshold" = threshold, "BalancedAccuracy" = balanced_acc)
+    evaluation <- rbind(evaluation, new_row)
+  }
+  
+  # Find the threshold with maximum balanced accuracy
+  max_balanced_acc <- max(evaluation[, "BalancedAccuracy"])
+  optimal_threshold <- evaluation[, "Threshold"][evaluation[, "BalancedAccuracy"] == max_balanced_acc]
+  
+  # Store the optimal threshold and balanced accuracy in the lists
+  optimal_thresholds[[i]] <- optimal_threshold
+  max_balanced_accs[[i]] <- max_balanced_acc
+  
+  # Print the results
+  cat("Model", i, ":\n")
+  cat("Optimal Threshold:", optimal_threshold, "\n")
+  cat("Balanced Accuracy:", max_balanced_acc, "\n\n")
+}
+
+# Same story with the randomForest models, almost no difference in threshold optimalisation.
+# This will of course be mentioned though.
+```
+
+### XGBoost Regression
+
+#### Data preparation
+
+```{r XG - Data prep}
+# Set different seed
+set.seed(333)
+
+# Create some empty lists for train/test sets
+XG_trainsets <- list() 
+XG_testsets <- list() 
+
+# Loop over the data frames for training/test sets
+for(i in seq_along(onehot_frames)) {
+  
+  current_frame <- onehot_frames[[i]]
+  current_target <- dummy_names[[i]]
+  
+  # Split using split_function
+  result <- split_function(current_frame, current_target)
+  
+  XG_trainsets[[i]] <- result$train
+  XG_testsets[[i]] <- result$test
+}
+```
+
+#### Base models
+
+```{r XG - Base models}
+XG0_models <- list()
+pb <- progress_bar$new(total = 4, format = "[:bar] :percent :elapsed")
+
+# Iterate over the data frames and target variables
+for (i in seq_along(XG_trainsets)) {
+  
+  current_train <- XG_trainsets[[i]]
+  current_target <- dummy_names[i]
+  
+  # Preprocess the target variable as binary
+  current_train[[current_target]] <- ifelse(current_train[[current_target]] == 0, 0, 1)
+
+  # Prepare the data matrix
+  dtrain <- xgb.DMatrix(data = as.matrix(current_train[, !colnames(current_train) %in% current_target]), 
+                        label = current_train[[current_target]])
+  
+  model <- xgb.train(data = dtrain, 
+                     nrounds = 100)
+  # Store model
+  XG0_models[[i]] <- model
+  pb$tick()
+}
+```
+
+```{r XG - Base models results}
+XG0_preds <- list()
+
+for (i in seq_along(XG0_models)) {
+  
+  model <- XG0_models[[i]]
+  current_test <- XG_testsets[[i]]
+  current_target <- dummy_names[i]
+  current_test[[current_target]] <- ifelse(current_test[[current_target]] == 0, 0, 1)
+  
+  # Prepare the data matrix
+  dtest <- xgb.DMatrix(data = as.matrix(current_test[, !colnames(current_test) %in% current_target]), 
+                       label = current_test[[current_target]])
+
+  XG0_preds[[i]] <- predict(model, dtest)
+
+  # Convert externalptr object to numeric vector
+  XG0_preds[[i]] <- as.numeric(XG0_preds[[i]])
+  
+  # Convert predicted values to binary labels
+  XG0_preds[[i]] <- factor(ifelse(XG0_preds[[i]] > 0.5, 1, 0), levels = c(0, 1))
+    
+  cm <- confusionMatrix(data = as.factor(XG0_preds[[i]]),
+                        reference = as.factor(current_test[[current_target]]))
+  
+  # Append the results to the all_results df
+  append_results(dummy_names[i], "XGBoost Regression", "Base",
+                 cm[["byClass"]][["Sensitivity"]],
+                 cm[["byClass"]][["Specificity"]],
+                 cm[["byClass"]][["F1"]],
+                 cm[["byClass"]][["Balanced Accuracy"]])
+}
+```
+
+#### Tuned models (Parameter Tuning)
+
+```{r XG - Parameter tuned}
+
+# NEEDS A FIX
+
+XG1_models <- list()
+pb <- progress_bar$new(total = 4, format = "[:bar] :percent :elapsed")
+
+# Iterate over the data frames and target variables
+for (i in seq_along(XG_trainsets)) {
+  
+  current_train <- XG_trainsets[[i]]
+  current_target <- dummy_names[i]
+  
+  # Preprocess the target variable as binary
+  #current_train[[current_target]] <- ifelse(current_train[[current_target]] == 0, 0, 1)
+
+  x <- current_train[, !colnames(current_train) %in% current_target]
+  y <- as.factor(current_train[[current_target]])
+  
+  # Apply stratified k-folds
+  cvIndex <- createFolds(factor(y), 5, returnTrain = TRUE)
+  
+  # Let trainControl evaluate on Balanced Accuracy
+  ctrl <- trainControl(index = cvIndex,
+                       method = "cv",
+                       classProbs = TRUE,
+                       summaryFunction = balanced_calc,
+                       verboseIter = FALSE) 
+  
+  # Define parameter grid
+  grid <- expand.grid(nrounds = c(100, 200, 300),      
+                      max_depth = c(3, 6, 9),     
+                      eta = c(0.1, 0.3, 0.5),     
+                      gamma = c(0, 0.1, 0.2),
+                      colsample_bytree = c(0.6, 0.8, 1),
+                      min_child_weight = c(1, 3, 5),
+                      subsample = c(0.6, 0.8, 1))
+  
+  model <- caret::train(x, 
+                        make.names(y),
+                        method = "xgbTree",           
+                        trControl = ctrl,            
+                        tuneGrid = grid,
+                        metric = "Balanced Accuracy",
+                        verbosity = 0)
+  # Store model
+  XG1_models[[i]] <- model
+  pb$tick()
+}
+```
+
+```{r XG - Parameter tuned results}
+XG1_preds <- list()
+
+for (i in seq_along(XG1_models)) {
+  
+  model <- XG1_models[[i]]
+  current_test <- XG_testsets[[i]]
+  current_target <- dummy_names[i]
+  current_test[[current_target]] <- ifelse(current_test[[current_target]] == 0, 0, 1)
+  
+  # Predictions have levels X0 and X1, so convert them
+  XG1_preds[[i]] <- factor(ifelse(predict(model, current_test) == "X0", 0, 1), levels = c(0,1))
+
+  cm <- confusionMatrix(data = XG1_preds[[i]],
+                        reference = as.factor(current_test[[current_target]]))
+  
+  # Append the results to the all_results df
+  append_results(dummy_names[i], "XGBoost Regression", "Parameter Tuned",
+                 cm[["byClass"]][["Sensitivity"]],
+                 cm[["byClass"]][["Specificity"]],
+                 cm[["byClass"]][["F1"]],
+                 cm[["byClass"]][["Balanced Accuracy"]])
+}
+```
+
+### AdaBoost 
+
+#### Data Preparation
+
+```{r AB - Data Prep}
+# Set different seed
+set.seed(667)
+
+# Create some empty lists for train/test sets
+AB_trainsets <- list() 
+AB_testsets <- list() 
+
+# Loop over the data frames for training/test sets
+for(i in seq_along(imputed_frames)) {
+  
+  current_frame <- imputed_frames[[i]]
+  current_target <- dummy_names[[i]]
+  
+  # Split using split_function
+  result <- split_function(current_frame, current_target)
+  
+  AB_trainsets[[i]] <- result$train
+  AB_testsets[[i]] <- result$test
+}
+```
+
+#### Base models
+
+```{r, AB - Base models}
+AB0_models <- list()
+AB0_preds <- list()
+
+# Loop over the data frames and target variables
+for (i in seq_along(AB_trainsets)) {
+
+  current_train <- AB_trainsets[[i]]
+  current_target <- dummy_names[i]
+
+  formula_str <- paste(current_target, "~ .")
+  
+  model <- boosting(formula = as.formula(formula_str),
+                        data = current_train,
+                        boos = TRUE,
+                        mfinal = 100)
+  
+  # Store the model in the list
+  AB0_models[[i]] <- model
+}
+```
+
+```{r AB - Base models results}
+AB0_preds <- list()
+
+for (i in seq_along(AB0_models)) {
+  
+  model <- AB0_models[[i]]
+  current_test <- AB_testsets[[i]]
+  current_target <- current_test[[dummy_names[i]]]
+  
+  # Make predictions
+  AB0_preds[[i]] <- predict(model, current_test)
+
+  cm <- confusionMatrix(data = as.factor(AB0_preds[[i]]$class),
+                        reference = as.factor(current_target))
+  
+  # Append the results to the all_results df
+  append_results(dummy_names[i], "Adaptive Boosting", "Base",
+                 cm[["byClass"]][["Sensitivity"]],
+                 cm[["byClass"]][["Specificity"]],
+                 cm[["byClass"]][["F1"]],
+                 cm[["byClass"]][["Balanced Accuracy"]])
+}
+```
+
+#### Tuned (Threshold Tuning)
+
+```{r AB - Threshold tuning}
+AB1_models <- list()
+
+for (i in seq_along(AB_trainsets)) {
+  
+  current_train <- AB_trainsets[[i]]
+  current_target <- dummy_names[i]
+  
+  x <- current_train[, !colnames(current_train) %in% current_target]
+  y <- current_train[[current_target]]
+  
+  # Apply stratified k-folds
+  cvIndex <- createFolds(factor(y), 5, returnTrain = TRUE)
+  
+  # Let trainControl evaluate on Balanced Accuracy
+  ctrl <- trainControl(index = cvIndex,
+                       method = "cv",
+                       classProbs = TRUE,
+                       summaryFunction = balanced_calc)
+  
+  model <- caret::train(x, 
+                        make.names(y),
+                        method = "AdaBoost.M1",
+                        trControl = ctrl,
+                        metric = "Balanced Accuracy")
+  
+  AB1_models[[i]] <- model
+}
+```
+
+```{r AB - Threshold tuning results}
+optimal_thresholds <- list()
+max_balanced_accs <- list()
+thresholds <- seq(0.05, 0.5, 0.05)
+
+# Iterate over the models
+for (i in seq_along(AB1_models)) {
+  
+  model <- AB1_models[[i]]
+  current_train <- AB_trainsets[[i]]
+  current_target <- current_train[[dummy_names[i]]]
+  
+  # Get the predicted probabilities for the positive class
+  predicted_probs <- predict(model, type = "prob")
+  
+  # Create a data frame to store evaluation metrics
+  evaluation <- data.frame(Threshold = numeric(),
+                           "Balanced Accuracy" = numeric(),
+                           stringsAsFactors = FALSE)
+  
+  # Calculate evaluation metrics for each threshold
+  for (threshold in thresholds) {
+    # Convert predicted probabilities to class labels based on the threshold
+    predicted_labels <- factor(ifelse(predicted_probs[, "X0"] >= threshold, 0, 1), levels = c(0, 1))
+    
+    # Calculate evaluation metrics
+    eval_metrics <- caret::confusionMatrix(predicted_labels, as.factor(current_target))
+    balanced_acc <- eval_metrics$byClass["Balanced Accuracy"]
+    
+    # Store the evaluation metrics in the data frame
+    new_row <- data.frame("Threshold" = threshold, "BalancedAccuracy" = balanced_acc)
+    evaluation <- rbind(evaluation, new_row)
+  }
+  
+  # Find the threshold with maximum balanced accuracy
+  max_balanced_acc <- max(evaluation[, "BalancedAccuracy"])
+  optimal_threshold <- evaluation[, "Threshold"][evaluation[, "BalancedAccuracy"] == max_balanced_acc]
+  
+  # Store the optimal threshold and balanced accuracy in the lists
+  optimal_thresholds[[i]] <- optimal_threshold
+  max_balanced_accs[[i]] <- max_balanced_acc
+  
+  # Print the results
+  cat("Model", i, ":\n")
+  cat("Optimal Threshold:", optimal_threshold, "\n")
+  cat("Balanced Accuracy:", max_balanced_acc, "\n\n")
+}
+```
+
+```{r AB - Threshold tuning results 2}
+AB1_preds <- list()
+
+for (i in seq_along(AB1_models)) {
+  
+  model <- AB1_models[[i]]
+  current_test <- AB_testsets[[i]]
+  current_target <- current_test[[dummy_names[i]]]
+  
+  # Make probability predictions
+  AB1_preds[[i]] <- predict(model, current_test, type = "prob")
+  
+  # Apply different thresholds
+  binary_preds <- ifelse(AB1_preds[[i]][, "X0"] >= optimal_thresholds[[i]], 0, 1)
+  
+  cm <- confusionMatrix(data = as.factor(binary_preds),
+                        reference = current_target)
+  
+  # Append the results to the all_results df
+  append_results(dummy_names[i], "Adaptive Boosting", "Threshold Tuned",
+                 cm[["byClass"]][["Sensitivity"]],
+                 cm[["byClass"]][["Specificity"]],
+                 cm[["byClass"]][["F1"]],
+                 cm[["byClass"]][["Balanced Accuracy"]])
+}
+```
+
+```{r}
+# Exporting the dataframe to a CSV file for the Concept version
+write.csv(all_results, 
+          "results.csv", 
+          row.names = FALSE)
+```
+
+
+Fin
+
